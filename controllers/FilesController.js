@@ -1,230 +1,214 @@
-import Queue from 'bull';
-import { ObjectId } from 'mongodb';
-import { v4 as uuidv4 } from 'uuid';
-import { mkdir, writeFile, readFileSync } from 'fs';
+import { existsSync, promises } from 'fs';
 import mime from 'mime-types';
-import dbClient from '../utils/db';
-import { getIdAndKey, isValidUser } from '../utils/users';
+import { getCurrentUser } from '../utils/auth';
+import File, { FOLDER, FilesCollection } from '../utils/file';
+import fileQueue from '../worker';
 
+const { readFile } = promises;
+
+/**
+ * FilesController class to manage user files
+ */
 class FilesController {
-  static async postUpload (request, response) {
-    const fileQ = new Queue('fileQ');
-    const dir = process.env.FOLDER_PATH || '/tmp/files_manager';
+  /**
+   * Handles uploading a file by creating a new File object and saving it to
+   * the database.
+   *
+   * @param {Object} request - The HTTP request object.
+   * @param {Object} response - The HTTP response object.
+   * @return {Object} The saved file as a JSON object, or an error message as a
+   * JSON object.
+   */
+  static async postUpload(request, response) {
+    const currentUser = await getCurrentUser(request);
 
-    const { userId } = await getIdAndKey(request);
-    if (!isValidUser(userId)) return response.status(401).send({ error: 'Unauthorized' });
-
-    const user = await dbClient.users.findOne({ _id: ObjectId(userId) });
-    if (!user) return response.status(401).send({ error: 'Unauthorized' });
-
-    const fileName = request.body.name;
-    if (!fileName) return response.status(400).send({ error: 'Missing name' });
-
-    const fileType = request.body.type;
-    if (!fileType || !['folder', 'file', 'image'].includes(fileType)) return response.status(400).send({ error: 'Missing type' });
-
-    const fileData = request.body.data;
-    if (!fileData && fileType !== 'folder') return response.status(400).send({ error: 'Missing data' });
-
-    const publicFile = request.body.isPublic || false;
-    let parentId = request.body.parentId || 0;
-    parentId = parentId === '0' ? 0 : parentId;
-    if (parentId !== 0) {
-      const parentFile = await dbClient.files.findOne({ _id: ObjectId(parentId) });
-      if (!parentFile) return response.status(400).send({ error: 'Parent not found' });
-      if (parentFile.type !== 'folder') return response.status(400).send({ error: 'Parent is not a folder' });
-    }
-
-    const fileInsertData = {
-      userId: user._id,
-      name: fileName,
-      type: fileType,
-      isPublic: publicFile,
-      parentId
-    };
-
-    if (fileType === 'folder') {
-      await dbClient.files.insertOne(fileInsertData);
-      return response.status(201).send({
-        id: fileInsertData._id,
-        userId: fileInsertData.userId,
-        name: fileInsertData.name,
-        type: fileInsertData.type,
-        isPublic: fileInsertData.isPublic,
-        parentId: fileInsertData.parentId
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
       });
     }
 
-    const fileUid = uuidv4();
-
-    const decData = Buffer.from(fileData, 'base64');
-    const filePath = `${dir}/${fileUid}`;
-
-    mkdir(dir, { recursive: true }, (error) => {
-      if (error) return response.status(400).send({ error: error.message });
-      return true;
-    });
-
-    writeFile(filePath, decData, (error) => {
-      if (error) return response.status(400).send({ error: error.message });
-      return true;
-    });
-
-    fileInsertData.localPath = filePath;
-    await dbClient.files.insertOne(fileInsertData);
-
-    fileQ.add({
-      userId: fileInsertData.userId,
-      fileId: fileInsertData._id
-    });
-
-    return response.status(201).send({
-      id: fileInsertData._id,
-      userId: fileInsertData.userId,
-      name: fileInsertData.name,
-      type: fileInsertData.type,
-      isPublic: fileInsertData.isPublic,
-      parentId: fileInsertData.parentId
-    });
-  }
-
-  static async getShow (request, response) {
-    const { userId } = await getIdAndKey(request);
-    if (!isValidUser(userId)) return response.status(401).send({ error: 'Unauthorized' });
-
-    const user = await dbClient.users.findOne({ _id: ObjectId(userId) });
-    if (!user) return response.status(401).send({ error: 'Unauthorized' });
-
-    const fileId = request.params.id || '';
-    const file = await dbClient.files.findOne({ _id: ObjectId(fileId), userId: user._id });
-    if (!file) return response.status(404).send({ error: 'Not found' });
-
-    return response.status(200).send({
-      id: file._id,
-      userId: file.userId,
-      name: file.name,
-      type: file.type,
-      isPublic: file.isPublic,
-      parentId: file.parentId
-    });
-  }
-
-  static async getIndex (request, response) {
-    const { userId } = await getIdAndKey(request);
-    if (!isValidUser(userId)) return response.status(401).send({ error: 'Unauthorized' });
-
-    const user = await dbClient.users.findOne({ _id: ObjectId(userId) });
-    if (!user) return response.status(401).send({ error: 'Unauthorized' });
-
-    let parentId = request.query.parentId || 0;
-    if (parentId === '0') parentId = 0;
-    if (parentId !== 0) {
-      if (!isValidUser(parentId)) return response.status(401).send({ error: 'Unauthorized' });
-
-      parentId = ObjectId(parentId);
-
-      const folder = await dbClient.files.findOne({ _id: ObjectId(parentId) });
-      if (!folder || folder.type !== 'folder') return response.status(200).send([]);
-    }
-
-    const page = request.query.page || 0;
-
-    const agg = { $and: [{ parentId }] };
-    let aggData = [{ $match: agg }, { $skip: page * 20 }, { $limit: 20 }];
-    if (parentId === 0) aggData = [{ $skip: page * 20 }, { $limit: 20 }];
-
-    const pageFiles = await dbClient.files.aggregate(aggData);
-    const files = [];
-
-    await pageFiles.forEach((file) => {
-      const fileObj = {
-        id: file._id,
-        userId: file.userId,
-        name: file.name,
-        type: file.type,
-        isPublic: file.isPublic,
-        parentId: file.parentId
-      };
-      files.push(fileObj);
-    });
-
-    return response.status(200).send(files);
-  }
-
-  static async putPublish (request, response) {
-    const { userId } = await getIdAndKey(request);
-    if (!isValidUser(userId)) return response.status(401).send({ error: 'Unauthorized' });
-
-    const user = await dbClient.users.findOne({ _id: ObjectId(userId) });
-    if (!user) return response.status(401).send({ error: 'Unauthorized' });
-
-    const fileId = request.params.id || '';
-
-    let file = await dbClient.files.findOne({ _id: ObjectId(fileId), userId: user._id });
-    if (!file) return response.status(404).send({ error: 'Not found' });
-
-    await dbClient.files.updateOne({ _id: ObjectId(fileId) }, { $set: { isPublic: true } });
-    file = await dbClient.files.findOne({ _id: ObjectId(fileId), userId: user._id });
-
-    return response.status(200).send({
-      id: file._id,
-      userId: file.userId,
-      name: file.name,
-      type: file.type,
-      isPublic: file.isPublic,
-      parentId: file.parentId
-    });
-  }
-
-  static async putUnpublish (request, response) {
-    const { userId } = await getIdAndKey(request);
-    if (!isValidUser(userId)) return response.status(401).send({ error: 'Unauthorized' });
-
-    const user = await dbClient.users.findOne({ _id: ObjectId(userId) });
-    if (!user) return response.status(401).send({ error: 'Unauthorized' });
-
-    const fileId = request.params.id || '';
-
-    let file = await dbClient.files.findOne({ _id: ObjectId(fileId), userId: user._id });
-    if (!file) return response.status(404).send({ error: 'Not found' });
-
-    await dbClient.files.updateOne({ _id: ObjectId(fileId) }, { $set: { isPublic: false } });
-    file = await dbClient.files.findOne({ _id: ObjectId(fileId), userId: user._id });
-
-    return response.status(200).send({
-      id: file._id,
-      userId: file.userId,
-      name: file.name,
-      type: file.type,
-      isPublic: file.isPublic,
-      parentId: file.parentId
-    });
-  }
-
-  static async getFile (request, response) {
-    const fileId = request.params.id || '';
-    const size = request.query.size || 0;
-
-    const file = await dbClient.files.findOne({ _id: ObjectId(fileId) });
-    if (!file) return response.status(404).send({ error: 'Not found' });
-
-    const { isPublic, userId, type } = file;
-
-    const { userId: user } = await getIdAndKey(request);
-
-    if ((!isPublic && !user) || (user && userId.toString() !== user && !isPublic)) return response.status(404).send({ error: 'Not found' });
-    if (type === 'folder') return response.status(400).send({ error: 'A folder doesn\'t have content' });
-
-    const path = size === 0 ? file.localPath : `${file.localPath}_${size}`;
+    const {
+      name, type, parentId, isPublic, data,
+    } = request.body;
 
     try {
-      const fileData = readFileSync(path);
-      const mimeType = mime.contentType(file.name);
-      response.setHeader('Content-Type', mimeType);
-      return response.status(200).send(fileData);
-    } catch (err) {
-      return response.status(404).send({ error: 'Not found' });
+      const file = new File(
+        currentUser.id, name, type, parentId, isPublic, data,
+      );
+      const savedFile = await file.save();
+      if (savedFile.type === 'image') {
+        fileQueue.add({
+          userId: currentUser.id,
+          fileId: savedFile.id,
+        });
+      }
+      return response.status(201).json(savedFile);
+    } catch (error) {
+      return response.status(400).json({
+        error: error.message,
+      });
     }
+  }
+
+  /**
+   * Returns a JSON response containing a file with the given id, if it belongs
+   * to the current user.
+   *
+   * @param {Object} request - the HTTP request object
+   * @param {Object} response - the HTTP response object
+   * @return {Promise<Object>} - a JSON response containing the file, or an
+   * error message
+   */
+  static async getShow(request, response) {
+    const currentUser = await getCurrentUser(request);
+
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
+      });
+    }
+
+    const { id } = request.params;
+    const filesCollection = new FilesCollection();
+    const file = await filesCollection.findUserFileById(currentUser.id, id);
+    if (!file) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+
+    return response.status(200).json(file);
+  }
+
+  /**
+   * Retrieves a list of files belonging to the current user, filtered by
+   * `parentId` and `page`.
+   *
+   * @param {Object} request - The request object containing query parameters.
+   * @param {Object} response - The response object to send the list of files.
+   * @return {Object} The HTTP response object with status code 200 and a JSON
+   * array of files.
+   */
+  static async getIndex(request, response) {
+    const currentUser = await getCurrentUser(request);
+
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
+      });
+    }
+
+    let { parentId, page } = request.query;
+    if (parentId === '0' || !parentId) parentId = 0;
+    page = Number.isNaN(page) ? 0 : Number(page);
+
+    const filesCollection = new FilesCollection();
+    const files = await filesCollection.findAllUserFilesByParentId(
+      currentUser.id,
+      parentId,
+      page,
+    );
+
+    return response.status(200).json(files);
+  }
+
+  /**
+   * Executes an asynchronous method to publish a file.
+   *
+   * @param {Object} request - An object containing the request data.
+   * @param {Object} response - An object containing the response data.
+   * @return {Promise} A promise that resolves to the updated publication object.
+   */
+  static async putPublish(request, response) {
+    return FilesController.updatePublication(request, response, true);
+  }
+
+  /**
+   * Executes an asynchronous method to unpublish a file.
+   *
+   * @param {Object} request - the request object
+   * @param {Object} response - the response object
+   * @return {Promise} - a Promise that resolves with the updated publication
+   */
+  static async putUnpublish(request, response) {
+    return FilesController.updatePublication(request, response, false);
+  }
+
+  /**
+   * Updates the publication status of a file.
+   *
+   * @param {Object} request - The HTTP request object.
+   * @param {Object} response - The HTTP response object.
+   * @param {boolean} isPublished - The new publication status of the file.
+   * @return {Object} The updated file object as a JSON response.
+   */
+  static async updatePublication(request, response, isPublished) {
+    const currentUser = await getCurrentUser(request);
+
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
+      });
+    }
+    const { id } = request.params;
+    const filesCollection = new FilesCollection();
+    const file = await filesCollection.updateFilePublication(
+      currentUser.id, id, isPublished,
+    );
+    if (!file) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+    return response.status(200).json(file);
+  }
+
+  /**
+   * Retrieves a file from the server given a file id and sends it as a response
+   *
+   * @param {Object} request - The HTTP request object.
+   * @param {Object} response - The HTTP response object.
+   * @return {Promise} Resolves with the file data, or rejects with an error
+   * message.
+   */
+  static async getFile(request, response) {
+    const currentUser = await getCurrentUser(request);
+
+    const { id } = request.params;
+    const { size } = request.query;
+    const filesCollection = new FilesCollection();
+    const file = await filesCollection.findPublicOrOwnFile(
+      currentUser ? currentUser.id : null,
+      id,
+    );
+    if (!file) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+
+    if (file.type === FOLDER) {
+      return response.status(400).json({
+        error: "A folder doesn't have content",
+      });
+    }
+
+    let filePath = file.localPath;
+    if (!Number.isNaN(size) && [500, 250, 100].includes(Number(size))) {
+      filePath += `_${size}`;
+    }
+
+    if (!existsSync(filePath)) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+
+    const mimeType = mime.lookup(file.name);
+    response.set('Content-Type', mimeType);
+    const data = await readFile(filePath);
+    return response.status(200).send(data);
   }
 }
 
